@@ -33,7 +33,7 @@ TEXTS = {
     "limit_reached": "🚫 Daily limit reached.",
     "invalid_link": "❌ Invalid link.",
     "premium_activated": "💎 Premium activated!",
-    "contact_admin": "📞 Contact admin: @youradminhandle",
+    "contact_admin": "📞 Contact admin: @PRO_GAMER_VIP_OWNER",
     "my_sub": "📜 Subscription: {}",
     "admin_set_key": "🔑 Enter new access key:",
     "admin_key_set": "✅ Access key updated.",
