@@ -1,391 +1,393 @@
-# bot.py - HIGH SPEED VERSION
-import logging
+# bot.py — MAXIMUM SPEED EDITION
 import asyncio
-import uvloop  # Faster event loop
-import orjson  # Faster JSON
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters,
-    CallbackQueryHandler, ContextTypes
-)
-from config import BOT_TOKEN, FREE_DAILY_LIMIT, SUBSCRIPTION_PLANS, MAX_VIDEO_SIZE_MB
-from database import *
-from terabox import get_terabox_download_info, download_video_with_progress
-from messages import *
-from utils import is_admin, generate_key
-import os
-import re
+import time
+import orjson
 from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+import httpx
+from config import (
+    TELEGRAM_BOT_TOKEN, ADMIN_IDS, TERABOX_API_URL,
+    FREE_USER_DAILY_LIMIT, ACCESS_KEY, TEXTS,
+    ENABLE_LOGGING, USE_STREAMING_UPLOAD
+)
 
-# Use uvloop for faster async
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+# ============= 🚀 GLOBAL STATE (IN-MEMORY CACHE) =============
+_user_cache = {}
+_db_path = "db.json"
+_last_save_time = time.time()
+_dirty = False
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Load DB into memory once at startup
+def load_db():
+    global _user_cache
+    try:
+        with open(_db_path, "rb") as f:
+            data = orjson.loads(f.read())
+            _user_cache = data.get("users", {})
+    except FileNotFoundError:
+        _user_cache = {}
 
-# Regex
-TERABOX_REGEX = re.compile(r'https?://(?:www\.)?terabox\.com/s/[\w\-]+')
+def save_db_background():
+    """Save only if dirty and not too frequently"""
+    global _dirty, _last_save_time
+    if not _dirty:
+        return
+    if time.time() - _last_save_time < 2:  # Throttle saves
+        return
+    try:
+        with open(_db_path, "wb") as f:
+            f.write(orjson.dumps({"users": _user_cache}))
+        _dirty = False
+        _last_save_time = time.time()
+        if ENABLE_LOGGING:
+            print("💾 Database saved")
+    except Exception as e:
+        if ENABLE_LOGGING:
+            print(f"❌ Error saving database: {e}")
 
-# Connection pool for aiohttp
-from aiohttp import TCPConnector, ClientSession
-connector = TCPConnector(limit=100, limit_per_host=30, ttl_dns_cache=300)
+def get_user(user_id):
+    uid = str(user_id)
+    if uid not in _user_cache:
+        _user_cache[uid] = {
+            "is_paid": False,
+            "access_key": "",
+            "subscription_expiry": "",
+            "downloads_today": 0,
+            "last_download_date": ""
+        }
+    return _user_cache[uid]
 
-# Semaphore to limit concurrent downloads
-MAX_CONCURRENT_DOWNLOADS = 20
-download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+def update_user(user_id, data):
+    uid = str(user_id)
+    user = get_user(user_id)
+    _user_cache[uid] = {**user, **data}
+    global _dirty
+    _dirty = True
+    # Schedule background save
+    asyncio.create_task(asyncio.sleep(0))
+    save_db_background()
 
-# Cache for frequently accessed data
-user_cache = {}
-key_cache = {}
-
-# Fast user cache
-async def get_user_cached(user_id):
-    if user_id in user_cache:
-        return user_cache[user_id]
-    user = await get_user(user_id)
-    if user:
-        user_cache[user_id] = user
-    return user
-
-# Fast key cache
-async def get_key_cached(key):
-    if key in key_cache:
-        return key_cache[key]
-    db_key = await get_key(key)
-    if db_key:
-        key_cache[key] = db_key
-    return db_key
-
-# Clear cache periodically
-async def clear_cache_periodically():
-    while True:
-        await asyncio.sleep(300)  # 5 minutes
-        user_cache.clear()
-        key_cache.clear()
-
-# Helper: Check if paid and active
-async def is_paid_active(user_id):
-    user = await get_user_cached(user_id)
-    if not user:
-        return False
-    if not user[3]:  # is_paid
-        return False
-    if user[4]:  # paid_until
-        paid_until = datetime.strptime(user[4], "%Y-%m-%d %H:%M:%S")
-        return paid_until > datetime.now()
+def is_paid_user(user_id):
+    user = get_user(user_id)
+    now = datetime.utcnow()
+    if user["is_paid"]:
+        if user["subscription_expiry"]:
+            try:
+                expiry = datetime.fromisoformat(user["subscription_expiry"])
+                return now < expiry
+            except:
+                return True
+        else:
+            return True
     return False
 
-# Fast reset daily count
-async def fast_reset_daily_count():
-    await reset_daily_count()
-    user_cache.clear()  # Clear cache after reset
+def reset_daily_downloads():
+    today = datetime.utcnow().date().isoformat()
+    for user_id in _user_cache:
+        user = _user_cache[user_id]
+        if user["last_download_date"] != today:
+            user["downloads_today"] = 0
+            user["last_download_date"] = today
+    global _dirty
+    _dirty = True
+    if ENABLE_LOGGING:
+        print("🔄 Daily download counters reset")
 
-# --- Command Handlers (Optimized) ---
+# ============= 🚀 ASYNC HTTP CLIENT (REUSED) =============
+_http_client = None
+
+async def get_http_client():
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            timeout=10.0,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+            http2=True
+        )
+    return _http_client
+
+# ============= ⚡ CORE HANDLERS (OPTIMIZED) =============
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    await add_user(user.id, user.username, user.first_name)
-    await update.message.reply_html(START_MSG)
+    user_id = user.id
+    user_data = get_user(user_id)
+    is_paid = is_paid_user(user_id)
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_html(HELP_MSG)
+    keyboard = [[InlineKeyboardButton("📥 Download Video", callback_data="menu")]]
+    
+    if not is_paid:
+        keyboard.append([InlineKeyboardButton("💎 Upgrade to Premium", callback_data="premium")])
+    
+    if user_id in ADMIN_IDS:
+        keyboard.append([InlineKeyboardButton("🔐 Admin Panel", callback_data="admin_panel")])
+    else:
+        keyboard.append([InlineKeyboardButton("📞 Contact Admin", callback_data="contact_admin")])
 
-async def subscription_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton(f"{SUBSCRIPTION_PLANS[k][1]}", callback_data=f"plan_{k}")]
-        for k in SUBSCRIPTION_PLANS
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_html(SUBSCRIPTION_MSG, reply_markup=reply_markup)
+    text = TEXTS["start"]
+    
+    if not is_paid:
+        remaining = FREE_USER_DAILY_LIMIT - user_data["downloads_today"]
+        text += f"\n\nDownloads left today: {remaining}/{FREE_USER_DAILY_LIMIT}"
+        if user_data["downloads_today"] >= FREE_USER_DAILY_LIMIT:
+            text += f"\n{TEXTS['limit_reached']}"
+    else:
+        text += "\n\n✅ You have unlimited downloads!"
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    plan = query.data.replace("plan_", "")
-    desc = SUBSCRIPTION_PLANS[plan][1]
-    await query.edit_message_text(
-        f"✅ You selected: <b>{desc}</b>\n\n"
-        "📞 <b>Contact @YourAdminUsername to buy.</b>\n"
-        "After payment, you'll get an access key to activate your plan.",
-        parse_mode='HTML'
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.edit_message_text(
+        "📤 Send me any Terabox video link to download:",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 Back to Home", callback_data="start")
+        ]])
     )
 
-async def claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /claim <access_key>")
+async def premium_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.edit_message_text(
+        f"💎 Premium Upgrade\n\n{TEXTS['contact_admin']}\n\nAfter payment, admin will activate your account with unlimited downloads.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Back", callback_data="start")
+        ]])
+    )
+
+async def contact_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.edit_message_text(
+        f"{TEXTS['contact_admin']}\n\nClick below to message admin directly:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📩 Message Admin", url=f"tg://user?id={ADMIN_IDS[0]}")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="start")]
+        ])
+    )
+
+async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
         return
-    key = context.args[0].strip().upper()
-    
-    db_key = await get_key_cached(key)
-    if not db_key:
-        await update.message.reply_text("❌ Invalid access key.")
-        return
-    if db_key[2] is not None:
-        await update.message.reply_text("❌ This key has already been used.")
-        return
+    await update.callback_query.edit_message_text(
+        "🔐 Admin Panel\n\nSelect an option below:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔑 Set Access Key", callback_data="admin_set_key")],
+            [InlineKeyboardButton("👤 Add Premium User", callback_data="admin_add_user")],
+            [InlineKeyboardButton("📊 View Users", callback_data="admin_view_users")],
+            [InlineKeyboardButton("🏠 Back to Home", callback_data="start")]
+        ])
+    )
 
-    duration_days = db_key[1]
-    paid_until = datetime.now() + timedelta(days=duration_days)
-    user_id = update.effective_user.id
+# ============= 📥 VIDEO DOWNLOAD HANDLER (ULTRA FAST) =============
 
-    await update_user(user_id, is_paid=True, paid_until=paid_until.strftime("%Y-%m-%d %H:%M:%S"))
-    await mark_key_used(key, user_id)
-    
-    # Update cache
-    if user_id in user_cache:
-        user_cache[user_id] = await get_user(user_id)
-
-    await update.message.reply_html(PAID_SUCCESS.format(days=duration_days))
-
-async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_html(CONTACT_MSG)
-
-async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = await get_user_cached(user_id)
-    if not user:
-        await update.message.reply_text("❌ User not found.")
-        return
-
-    if await is_paid_active(user_id):
-        paid_until = datetime.strptime(user[4], "%Y-%m-%d %H:%M:%S")
-        days_left = (paid_until - datetime.now()).days
-        msg = f"✅ You are a <b>paid user</b>.\n<b>{days_left} days</b> remaining."
-    else:
-        msg = "❌ You are a <b>free user</b> (5 downloads/day).\nUpgrade for unlimited access."
-    await update.message.reply_html(msg)
-
-# --- HIGH SPEED Terabox Link Handler ---
-async def handle_terabox(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with download_semaphore:  # Limit concurrent downloads
-        await process_terabox_download(update, context)
-
-async def process_terabox_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start_time = time.time()
     user = update.effective_user
     user_id = user.id
-    url = update.message.text.strip()
+    link = update.message.text.strip()
 
-    if not TERABOX_REGEX.match(url):
-        await update.message.reply_text("❌ Please send a valid Terabox link")
+    # Validate link
+    if "terabox" not in link.lower():
+        await update.message.reply_text(TEXTS["invalid_link"])
         return
 
-    # Fast reset check
-    await fast_reset_daily_count()
+    user_data = get_user(user_id)
+    is_paid = is_paid_user(user_id)
 
-    user_data = await get_user_cached(user_id)
-    if not user_data:
-        await add_user(user_id, user.username, user.first_name)
-        user_data = await get_user_cached(user_id)
-
-    daily_count = user_data[5]
-    is_paid = await is_paid_active(user_id)
-
-    if not is_paid and daily_count >= FREE_DAILY_LIMIT:
-        await update.message.reply_html(FREE_LIMIT_MSG)
+    # Check daily limit for free users
+    if not is_paid and user_data["downloads_today"] >= FREE_USER_DAILY_LIMIT:
+        await update.message.reply_text(TEXTS["limit_reached"])
         return
 
-    status_msg = await update.message.reply_text("🔍 Fetching...")
+    # Show processing message
+    status_msg = await update.message.reply_text(TEXTS["processing"])
 
-    # Use faster session
-    async with ClientSession(connector=connector) as session:
-        info = await get_terabox_download_info(url, session)
-        if not info["success"]:
-            await status_msg.edit_text(f"❌ Failed: {info['error']}")
-            return
-
-        if info["size_mb"] > MAX_VIDEO_SIZE_MB:
-            await status_msg.edit_text(
-                f"❌ Too large: {info['size_mb']:.1f} MB. Max: {MAX_VIDEO_SIZE_MB} MB."
-            )
-            return
-
-        # Send thumbnail if available
-        if info["thumbnail"]:
-            try:
-                await context.bot.send_photo(
-                    chat_id=user_id,
-                    photo=info["thumbnail"],
-                    caption=f"🎥 {info['filename'][:30]}...\n📏 {info['size_mb']:.1f} MB"
-                )
-            except:
-                pass  # Non-critical
-
-        # Create file path
-        file_path = f"downloads/{user_id}_{int(datetime.now().timestamp())}_{os.path.basename(info['filename'])}"
-        os.makedirs("downloads", exist_ok=True)
-
-        try:
-            # Fast download with progress
-            success = await download_video_with_progress(
-                info["download_link"], file_path, update, context, status_msg, session
-            )
-            if not success:
-                return
-
-            await status_msg.edit_text("📤 Uploading...")
+    try:
+        # Get reusable HTTP client
+        client = await get_http_client()
+        
+        # Fetch video info (async)
+        api_url = TERABOX_API_URL.format(link)
+        if ENABLE_LOGGING:
+            print(f"📡 Fetching from API: {api_url[:100]}...")
             
-            # Fast upload
-            with open(file_path, 'rb') as f:
-                await context.bot.send_video(
-                    chat_id=user_id,
-                    video=InputFile(f, filename=info["filename"]),
-                    caption=f"🎥 {info['filename'][:50]}...",
-                    supports_streaming=True,
-                    read_timeout=300,
-                    write_timeout=300
-                )
-
-            # Update count for free users
-            if not is_paid:
-                await update_user(user_id, daily_count=daily_count + 1)
-                # Update cache
-                if user_id in user_cache:
-                    user_cache[user_id] = await get_user(user_id)
-
-            await status_msg.delete()
-
-        except Exception as e:
-            logger.error(f"Upload failed: {e}")
-            await status_msg.edit_text("❌ Upload failed. Try again.")
-        finally:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-
-# --- Admin Commands (Optimized) ---
-async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /genkey <plan>")
-        return
-    plan = context.args[0].lower()
-    if plan not in SUBSCRIPTION_PLANS:
-        await update.message.reply_text("❌ Invalid plan.")
-        return
-    duration_days = SUBSCRIPTION_PLANS[plan][0]
-    key = generate_key()
-    await add_key(key, duration_days)
-    await update.message.reply_text(f"✅ Key:\n<code>{key}</code>\nPlan: {plan}", parse_mode='HTML')
-
-async def listkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    keys = await get_all_keys()
-    if not keys:
-        await update.message.reply_text("📭 No keys found.")
-        return
-    msg = "🔑 <b>Keys:</b>\n\n"
-    for k in keys[:20]:  # Limit to 20 for speed
-        used = "Used" if k[2] else "Available"
-        msg += f"<code>{k[0]}</code> ({k[1]}d) - {used}\n"
-    await update.message.reply_html(msg)
-
-async def delkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /delkey <key>")
-        return
-    key = context.args[0].strip().upper()
-    db_key = await get_key_cached(key)
-    if not db_key:
-        await update.message.reply_text("❌ Key not found.")
-        return
-    await delete_key(key)
-    if key in key_cache:
-        del key_cache[key]
-    await update.message.reply_text(f"✅ Key <code>{key}</code> deleted.", parse_mode='HTML')
-
-async def adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if len(context.args) != 2:
-        await update.message.reply_text("Usage: /adduser <user_id> <plan>")
-        return
-    try:
-        user_id = int(context.args[0])
-        plan = context.args[1].lower()
-        if plan not in SUBSCRIPTION_PLANS:
-            await update.message.reply_text("❌ Invalid plan.")
+        response = await client.get(api_url)
+        if response.status_code != 200:
+            await status_msg.edit_text("❌ API Error. Try again later.")
             return
-        duration_days = SUBSCRIPTION_PLANS[plan][0]
-        paid_until = datetime.now() + timedelta(days=duration_days)
-        await update_user(user_id, is_paid=True, paid_until=paid_until.strftime("%Y-%m-%d %H:%M:%S"))
-        if user_id in user_cache:
-            user_cache[user_id] = await get_user(user_id)
-        await update.message.reply_text(f"✅ User {user_id} added to {plan} plan.")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user ID.")
+            
+        data = orjson.loads(response.content)
+        video_url = data.get("video")
+        
+        if not video_url:
+            await status_msg.edit_text("❌ Could not extract video. Link may be invalid.")
+            return
 
-async def removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /removeuser <user_id>")
-        return
-    try:
-        user_id = int(context.args[0])
-        await update_user(user_id, is_paid=False, paid_until=None)
-        if user_id in user_cache:
-            del user_cache[user_id]
-        await update.message.reply_text(f"✅ User {user_id} removed.")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user ID.")
+        # Update download counter
+        if not is_paid:
+            user_data["downloads_today"] += 1
+            update_user(user_id, {"downloads_today": user_data["downloads_today"]})
 
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /broadcast <message>")
-        return
-    msg = ' '.join(context.args)
-    async with aiosqlite.connect("users.db") as db:
-        async with db.execute("SELECT user_id FROM users LIMIT 1000") as cursor:  # Limit for speed
-            users = await cursor.fetchall()
-    sent = 0
-    for (user_id,) in users:
-        try:
-            await context.bot.send_message(chat_id=user_id, text=msg, read_timeout=10, write_timeout=10)
-            sent += 1
-        except:
-            pass  # Skip failed users
-    await update.message.reply_text(f"✅ Sent to {sent} users.")
+        await status_msg.edit_text(TEXTS["uploading"])
 
-# --- Error Handler ---
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Error: {context.error}")
+        # STREAM DIRECTLY TO TELEGRAM (NO BUFFERING)
+        if USE_STREAMING_UPLOAD:
+            await context.bot.send_video(
+                chat_id=update.effective_chat.id,
+                video=video_url,
+                supports_streaming=True,
+                read_timeout=60,
+                write_timeout=60,
+                connect_timeout=30
+            )
+        else:
+            # Fallback: download then upload
+            if ENABLE_LOGGING:
+                print("📥 Downloading video content...")
+            video_data = await client.get(video_url)
+            await context.bot.send_video(
+                chat_id=update.effective_chat.id,
+                video=video_data.content,
+                supports_streaming=True
+            )
 
-# --- Main ---
-def main():
-    # Start cache cleaner task
-    loop = asyncio.get_event_loop()
-    loop.create_task(clear_cache_periodically())
+        await status_msg.edit_text(TEXTS["success"])
+        
+        if ENABLE_LOGGING:
+            duration = time.time() - start_time
+            print(f"⏱️ Download completed in {duration:.2f}s")
+
+    except Exception as e:
+        if ENABLE_LOGGING:
+            print(f"❌ Error: {str(e)}")
+        await status_msg.edit_text("⚠️ Failed to process video. Please try again.")
+
+# ============= 👑 ADMIN HANDLERS =============
+
+async def admin_set_key_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    await update.callback_query.edit_message_text(TEXTS["admin_set_key"])
+    context.user_data["awaiting_key"] = True
+
+async def admin_add_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    await update.callback_query.edit_message_text(TEXTS["admin_add_user"])
+    context.user_data["awaiting_user_id"] = True
+
+async def admin_view_users_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
     
-    application = Application.builder().token(BOT_TOKEN).build()
+    user_list = []
+    for uid, data in _user_cache.items():
+        status = "💎 Premium" if data["is_paid"] else "🆓 Free"
+        if data["is_paid"] and data["subscription_expiry"]:
+            expiry = data["subscription_expiry"][:10]
+            status += f" (until {expiry})"
+        downloads = data["downloads_today"]
+        user_list.append(f"• {uid}: {status} | Today: {downloads} downloads")
+    
+    text = "📊 Users List:\n\n" + "\n".join(user_list[:50])  # Limit to 50 users
+    if len(_user_cache) > 50:
+        text += f"\n\n... and {len(_user_cache) - 50} more users"
+    
+    await update.callback_query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Back to Admin", callback_data="admin_panel")
+        ]])
+    )
 
+async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        return
+
+    text = update.message.text.strip()
+
+    if context.user_data.get("awaiting_key"):
+        global ACCESS_KEY
+        ACCESS_KEY = text
+        del context.user_data["awaiting_key"]
+        await update.message.reply_text(TEXTS["admin_key_set"])
+        
+    elif context.user_data.get("awaiting_user_id"):
+        try:
+            target_id = int(text)
+            expiry = (datetime.utcnow() + timedelta(days=30)).isoformat()
+            update_user(target_id, {
+                "is_paid": True,
+                "access_key": ACCESS_KEY,
+                "subscription_expiry": expiry
+            })
+            await update.message.reply_text(TEXTS["admin_add_success"].format(target_id))
+        except Exception as e:
+            if ENABLE_LOGGING:
+                print(f"Error adding user: {e}")
+            await update.message.reply_text(TEXTS["admin_invalid_id"])
+        del context.user_data["awaiting_user_id"]
+
+# ============= 🔄 CALLBACK ROUTER =============
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    handlers = {
+        "start": start,
+        "menu": menu_callback,
+        "premium": premium_callback,
+        "contact_admin": contact_admin_callback,
+        "admin_panel": admin_panel_callback,
+        "admin_set_key": admin_set_key_callback,
+        "admin_add_user": admin_add_user_callback,
+        "admin_view_users": admin_view_users_callback,
+    }
+    
+    handler = handlers.get(query.data)
+    if handler:
+        if asyncio.iscoroutinefunction(handler):
+            await handler(update, context)
+        else:
+            await handler(update, context)
+
+# ============= 🚀 STARTUP & DAILY RESET =============
+
+async def daily_reset_task():
+    while True:
+        now = datetime.utcnow()
+        # Calculate seconds until next UTC midnight
+        tomorrow = now.date() + timedelta(days=1)
+        midnight = datetime.combine(tomorrow, datetime.min.time())
+        sleep_seconds = (midnight - now).total_seconds()
+        
+        if ENABLE_LOGGING:
+            print(f"💤 Sleeping for {sleep_seconds:.0f} seconds until next daily reset")
+            
+        await asyncio.sleep(sleep_seconds)
+        reset_daily_downloads()
+
+def main():
+    # Load database into memory
+    load_db()
+    
+    # Create bot application
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
     # Add handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("subscription", subscription_menu))
-    application.add_handler(CommandHandler("claim", claim))
-    application.add_handler(CommandHandler("contact", contact))
-    application.add_handler(CommandHandler("myplan", check_subscription))
-
-    application.add_handler(CommandHandler("genkey", genkey))
-    application.add_handler(CommandHandler("listkeys", listkeys))
-    application.add_handler(CommandHandler("delkey", delkey))
-    application.add_handler(CommandHandler("adduser", adduser))
-    application.add_handler(CommandHandler("removeuser", removeuser))
-    application.add_handler(CommandHandler("broadcast", broadcast))
-
-    application.add_handler(CallbackQueryHandler(button_callback))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_terabox))
-
-    application.add_error_handler(error_handler)
-
-    print("🚀 HIGH-SPEED Terabox Bot is running...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video_link))
+    application.add_handler(MessageHandler(filters.TEXT, handle_admin_input))
+    
+    # Start daily reset task
+    asyncio.create_task(daily_reset_task())
+    
+    if ENABLE_LOGGING:
+        print("🚀 Bot starting with maximum performance...")
+        print(f"👥 Loaded {_user_cache.__len__()} users from database")
+    
+    # Start polling
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    asyncio.run(init_db())
     main()
