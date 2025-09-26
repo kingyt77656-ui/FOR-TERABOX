@@ -1,8 +1,8 @@
 # config.py — Optimized for speed
 
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
+TELEGRAM_BOT_TOKEN = "8356383599:AAH5xQrrUiDz1NXKqJi8-DLC8MDzaP8JT9Y"
 
-ADMIN_IDS = [123456789]  # Replace with your Telegram ID
+ADMIN_IDS = [5016461081]  # Replace with your Telegram ID
 
 # Terabox API URL
 TERABOX_API_URL = "https://weathered-mouse-6d3e.gaurav281833.workers.dev/api?url={}"
